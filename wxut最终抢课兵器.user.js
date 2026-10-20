@@ -25,6 +25,7 @@
     gapMs: 2500,
     maxAttempts: 80,
     ultimate: false,
+    ultimateMs: 800,
   };
 
   // ------------------------------------------------------------ 本地存储
@@ -289,6 +290,12 @@
     return false;
   }
 
+  // 终极模式查询间隔（毫秒），支持运行中随时调整
+  function ultimateInterval(cfg) {
+    const v = Number(state.cfg && state.cfg.ultimateMs) || Number(cfg.ultimateMs) || 800;
+    return Math.max(300, Math.min(10000, v));
+  }
+
   function pickButtons(doc) {
     return [...doc.querySelectorAll('a,button,input')].filter((el) => {
       const t = (el.innerText || el.value || '').trim();
@@ -506,6 +513,9 @@
       maxCourses: Math.max(1, Math.min(2, parseInt(el.querySelector('#xk-max').value, 10) || 2)),
       startAt: el.querySelector('#xk-start-at').value || '',
       ultimate,
+      ultimateMs: Math.round(
+        Math.max(0.3, Math.min(10, parseFloat(el.querySelector('#xk-speed').value) || 0.8)) * 1000
+      ),
     });
   }
 
@@ -597,8 +607,9 @@
   async function loop(cfg) {
     let emptyRounds = 0;
     while (state.running && state.success.length < cfg.maxCourses) {
+      const interval = ultimateInterval(cfg);
       // 终极模式：定时点一次“查询”，让余量刷新
-      if (cfg.ultimate && Date.now() - (state.lastRefreshClick || 0) > 4000) {
+      if (cfg.ultimate && Date.now() - (state.lastRefreshClick || 0) > Math.max(2000, interval * 3)) {
         const rb = findRefreshBtn();
         if (rb) {
           state.lastRefreshClick = Date.now();
@@ -744,7 +755,7 @@
         emptyRounds = 0;
       }
       if (!acted) updateStatus();
-      await sleep(cfg.ultimate ? Math.min(cfg.pollMs, 800) : cfg.pollMs);
+      await sleep(cfg.ultimate ? interval : cfg.pollMs);
     }
 
     if (state.success.length >= cfg.maxCourses) {
@@ -1018,6 +1029,9 @@
   .xk-target .xk-place{flex:1}
   .xk-opt{display:flex;align-items:center;gap:6px;margin:2px 0 8px;color:#c0392b;font-size:11px}
   .xk-opt input{accent-color:#c0392b}
+  .xk-speed{display:flex;align-items:center;gap:5px;margin:-3px 0 8px 20px;color:#44546a;font-size:11px}
+  .xk-speed input{width:52px;border:1px solid #cfd8e3;border-radius:5px;padding:2px 4px;
+    font:11px/1.4 inherit;text-align:center}
   .xk-del{border:0;background:#f2f5f9;color:#9aa7b8;border-radius:5px;width:24px;cursor:pointer}
   #xk-add{width:100%;border:1px dashed #9dc0e8;background:#f7fbff;color:#2476c9;
     border-radius:5px;padding:4px;cursor:pointer;margin-bottom:8px}
@@ -1112,6 +1126,7 @@
         </div>
         <label class="xk-opt"><input id="xk-ultimate" type="checkbox"${cfg.ultimate ? ' checked' : ''}> 终极模式：有课直接抢（过滤已满、持续查询）</label>
         <div id="xk-recommend">推荐打开过滤已满课程</div>
+        <div class="xk-speed">查询间隔 <input id="xk-speed" type="number" min="0.3" max="10" step="0.1" value="${(cfg.ultimateMs || 800) / 1000}"> 秒</div>
         <datalist id="xk-places"></datalist>
         <div class="xk-btns">
           <button id="xk-start">开始</button>
@@ -1147,6 +1162,7 @@
     win.querySelector('#xk-max').addEventListener('change', persist);
     win.querySelector('#xk-start-at').addEventListener('change', persist);
     win.querySelector('#xk-ultimate').addEventListener('change', persist);
+    win.querySelector('#xk-speed').addEventListener('change', persist);
 
     if (store.get(OPEN_KEY, true) === false) win.classList.add('xk-fold');
     win.querySelector('#xk-min').onclick = () => {
