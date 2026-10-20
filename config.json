@@ -1,0 +1,9 @@
+{
+  "_说明": "targets 按优先级从上到下排列；name 必填，teacher/time 可选，用来区分同名课程；最多选 max_courses 门",
+  "max_courses": 2,
+  "interval_seconds": 3,
+  "jitter_seconds": 1.0,
+  "refresh_seconds": 15,
+  "deadline": "2026-10-23 13:30",
+  "targets": []
+}
