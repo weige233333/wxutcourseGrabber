@@ -18,12 +18,13 @@
   const AUTOSTART_KEY = 'wxut_xk_autostart_v2';
 
   const DEFAULTS = {
-    targets: [{ name: 'AIGC应用', teacher: '史荧中', cat: '文化' }],
+    targets: [{ name: 'AIGC应用', teacher: '史荧中', cat: '文化', place: '' }],
     maxCourses: 2,
     startAt: '', // HH:MM:SS，留空表示立即开始
     pollMs: 1200,
     gapMs: 2500,
     maxAttempts: 80,
+    ultimate: false,
   };
 
   // ------------------------------------------------------------ 本地存储
@@ -63,6 +64,9 @@
           tabCat: '',
           failAt: {},
           alertFail: false,
+          fullNote: {},
+          lastRefreshClick: 0,
+          allDone: false,
           attempts: {},
           clickedAt: {},
           lastClicked: '',
@@ -86,6 +90,9 @@
         tabCat: '',
         failAt: {},
         alertFail: false,
+        fullNote: {},
+        lastRefreshClick: 0,
+        allDone: false,
         attempts: {},
         clickedAt: {},
         lastClicked: '',
@@ -99,7 +106,7 @@
 
   const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const keyOf = (t) => `${t.name || ''}|${t.teacher || ''}|${t.cat || ''}`;
-  const labelOf = (t) => t.name || `${t.cat || ''}（任意）`;
+  const labelOf = (t) => t.name || (t.cat ? `${t.cat}（任意）` : '任意课程');
 
   // ------------------------------------------------------------ 日志与状态
 
@@ -224,9 +231,62 @@
         return t === '选课' || t === '选择' || t === '选定';
       });
       if (!btn) return;
-      rows.push({ tr, text, btn, doc });
+      rows.push({ tr, text, btn, doc, remaining: rowRemaining(tr) });
     });
     return rows;
+  }
+
+  const REMAIN_CACHE = new WeakMap();
+
+  // 从表头找“余量/已选/容量”列，算出这门课还剩几个位置
+  function tableRemainMap(table) {
+    if (REMAIN_CACHE.has(table)) return REMAIN_CACHE.get(table);
+    let map = null;
+    for (const tr of table.querySelectorAll('tr')) {
+      const cells = [...tr.children].filter((td) => /^(TD|TH)$/.test(td.tagName));
+      if (cells.length < 2) continue;
+      const texts = cells.map((c) => (c.innerText || c.textContent || '').replace(/\s+/g, '').trim());
+      const rem = texts.findIndex((t) => /余量|剩余/.test(t));
+      const sel = texts.findIndex((t) => /已选/.test(t));
+      const cap = texts.findIndex((t) => /容量|上限|限额/.test(t));
+      if (rem >= 0 || (sel >= 0 && cap >= 0)) {
+        map = { rem, sel, cap };
+        break;
+      }
+    }
+    REMAIN_CACHE.set(table, map);
+    return map;
+  }
+
+  function rowRemaining(tr) {
+    const table = tr.closest('table');
+    const map = table ? tableRemainMap(table) : null;
+    if (!map) return null;
+    const cells = [...tr.children].filter((td) => /^(TD|TH)$/.test(td.tagName));
+    const cellText = (i) =>
+      i >= 0 && i < cells.length ? (cells[i].innerText || cells[i].textContent || '').replace(/\s+/g, '') : '';
+    const num = (s) => {
+      const m = s.match(/-?\d+/);
+      return m ? parseInt(m[0], 10) : null;
+    };
+    if (map.rem >= 0) return num(cellText(map.rem));
+    if (map.sel >= 0 && map.cap >= 0) {
+      const s = num(cellText(map.sel));
+      const c = num(cellText(map.cap));
+      if (s !== null && c !== null) return c - s;
+    }
+    return null;
+  }
+
+  // 是否已满：表格余量优先，其次看文字
+  function rowIsFull(row) {
+    if (row.remaining !== null && row.remaining !== undefined) return row.remaining <= 0;
+    if (/已满|无余量|名额已满|余量为\s*0/.test(row.text)) return true;
+    const m = row.text.match(/余量[:：]?\s*(-?\d+)/);
+    if (m) return parseInt(m[1], 10) <= 0;
+    const m2 = row.text.match(/已选\s*(\d+)\s*[\/／]\s*(\d+)/);
+    if (m2) return parseInt(m2[1], 10) >= parseInt(m2[2], 10);
+    return false;
   }
 
   function pickButtons(doc) {
@@ -256,17 +316,30 @@
     return null;
   }
 
+  // 选课页上的“查询/刷新”按钮
+  function findRefreshBtn() {
+    for (const win of collectWins()) {
+      const el = [...win.document.querySelectorAll('a,button,input')].find((n) =>
+        /^(查询|搜索|刷新|检索)$/.test((n.innerText || n.value || '').trim())
+      );
+      if (el) return el;
+    }
+    return null;
+  }
+
   function matches(text, t) {
     if (t.name && !text.includes(t.name)) return false;
     if (t.teacher && !text.includes(t.teacher)) return false;
+    if (t.place && !text.includes(t.place)) return false;
     return !!(t.name || t.teacher || t.cat);
   }
 
   // 保底目标（只填类别、不填课名）：必须是该系统上识别出来的同类课程
   function matchesTarget(text, t, doc) {
     if (t.name) return matches(text, t);
-    if (!t.cat) return false;
     if (t.teacher && !text.includes(t.teacher)) return false;
+    if (t.place && !text.includes(t.place)) return false;
+    if (!t.cat) return true; // 终极模式：课名和类别都空 = 任意有空位的课
     return courseCat(text, doc) === t.cat;
   }
 
@@ -419,17 +492,20 @@
   function collectCfg() {
     const el = document.getElementById('xk-win');
     if (!el) return state.cfg || loadCfg();
+    const ultimate = el.querySelector('#xk-ultimate').checked;
     const targets = [...el.querySelectorAll('.xk-target')]
       .map((row) => ({
         name: row.querySelector('.xk-name').value.trim(),
         teacher: row.querySelector('.xk-teacher').value.trim(),
         cat: row.querySelector('.xk-cat').value || '',
+        place: row.querySelector('.xk-place').value.trim(),
       }))
-      .filter((t) => t.name || t.cat);
+      .filter((t) => t.name || t.cat || ultimate);
     return Object.assign({}, state.cfg, {
       targets,
       maxCourses: Math.max(1, Math.min(2, parseInt(el.querySelector('#xk-max').value, 10) || 2)),
       startAt: el.querySelector('#xk-start-at').value || '',
+      ultimate,
     });
   }
 
@@ -482,6 +558,9 @@
     state.tabCat = '';
     state.failAt = {};
     state.alertFail = false;
+    state.fullNote = {};
+    state.lastRefreshClick = 0;
+    state.allDone = false;
     state.cfg = cfg;
     collectWins().forEach((w) => hookWindow(w));
     state.baseline = scanExisting();
@@ -518,6 +597,20 @@
   async function loop(cfg) {
     let emptyRounds = 0;
     while (state.running && state.success.length < cfg.maxCourses) {
+      // 终极模式：定时点一次“查询”，让余量刷新
+      if (cfg.ultimate && Date.now() - (state.lastRefreshClick || 0) > 4000) {
+        const rb = findRefreshBtn();
+        if (rb) {
+          state.lastRefreshClick = Date.now();
+          try {
+            rb.click();
+          } catch (e) {
+            /* 忽略 */
+          }
+          await sleep(600);
+        }
+      }
+
       const wins = collectWins();
       let visibleRows = 0;
       const candidates = [];
@@ -532,7 +625,7 @@
           const k = keyOf(t);
           if (state.success.includes(k) || seen.has(k)) continue;
           if (state.success.length >= cfg.maxCourses) break;
-          if ((state.attempts[k] || 0) >= cfg.maxAttempts) continue;
+          if (!cfg.ultimate && (state.attempts[k] || 0) >= cfg.maxAttempts) continue;
           if (Date.now() - (state.clickedAt[k] || 0) < cfg.gapMs) continue;
 
           // 保底目标可能对应多门课：优先挑最近没失败过的
@@ -542,10 +635,19 @@
             if (loose) list = [loose];
           }
           if (!list.length) continue;
-          const fresh = list.filter(
+          // 终极模式：只要还有余量的，满了就跳过，等它放位
+          const usable = cfg.ultimate ? list.filter((r) => !rowIsFull(r)) : list;
+          if (!usable.length) {
+            if (Date.now() - (state.fullNote[k] || 0) > 30000) {
+              state.fullNote[k] = Date.now();
+              log(`「${labelOf(t)}」已满，持续监控中…`);
+            }
+            continue;
+          }
+          const fresh = usable.filter(
             (r) => Date.now() - (state.failAt[k + '||' + rowKey(r)] || 0) > 180000
           );
-          const row = fresh[0] || list[0];
+          const row = fresh[0] || usable[0];
           seen.add(k);
           candidates.push({ t, k, row, win, cat: rowCat(row.text, t, win.document) });
         }
@@ -628,6 +730,13 @@
         updateStatus();
       }
 
+      // 所有目标都已完成，收工
+      if (state.success.length && cfg.targets.every((t) => state.success.includes(keyOf(t)))) {
+        log('目标都已抢到，停止');
+        state.allDone = true;
+        break;
+      }
+
       if (!visibleRows) {
         emptyRounds++;
         if (emptyRounds === 1) log('没找到课程：请先进入“选课轮次”里的选课页，看到“选课”按钮再开始');
@@ -635,12 +744,14 @@
         emptyRounds = 0;
       }
       if (!acted) updateStatus();
-      await sleep(cfg.pollMs);
+      await sleep(cfg.ultimate ? Math.min(cfg.pollMs, 800) : cfg.pollMs);
     }
 
     if (state.success.length >= cfg.maxCourses) {
       log(`已选满 ${cfg.maxCourses} 门，自动停止`);
       setStatus(`完成 ${state.success.length}/${cfg.maxCourses}`);
+    } else if (state.allDone) {
+      setStatus('目标已全部抢到');
     } else if (!state.running) {
       setStatus('已停止');
     }
@@ -661,6 +772,7 @@
       return;
     }
     log(`页面共 ${picks || rows.length} 个“选课”入口`);
+    refreshPlaceOptions();
     cfg.targets.forEach((t) => {
       let hit = rows.find((r) => matchesTarget(r.text, t, r.doc || window.document));
       if (!hit) {
@@ -711,6 +823,174 @@
     }
   }
 
+  // ------------------------------------------------------------ 导出课程表
+
+  const FIELD_PATTERNS = [
+    ['code', /课程(编号|号|代码|编码)/],
+    ['name', /课程名称|课程名/],
+    ['credit', /学分/],
+    ['teacher', /任课教师|教师|老师/],
+    ['time', /上课时间|节次|时间/],
+    ['place', /上课地点|地点|教室/],
+    ['cat', /通选课类别|课程类别|通识类别|课程性质|类别/],
+  ];
+
+  function headerFields(cells) {
+    const map = {};
+    cells.forEach((text, idx) => {
+      for (const [key, re] of FIELD_PATTERNS) {
+        if (map[key] === undefined && re.test(text)) map[key] = idx;
+      }
+    });
+    return map.name !== undefined ? map : null;
+  }
+
+  function extractTableCourses(doc) {
+    const out = [];
+    doc.querySelectorAll('table').forEach((table) => {
+      let map = null;
+      for (const tr of table.querySelectorAll('tr')) {
+        const cells = [...tr.children].filter((td) => /^(TD|TH)$/.test(td.tagName));
+        if (!cells.length) continue;
+        const texts = cells.map((c) => (c.innerText || c.textContent || '').replace(/\s+/g, ' ').trim());
+        if (!map) {
+          map = headerFields(texts);
+          continue;
+        }
+        const val = (k) => (map[k] !== undefined ? texts[map[k]] || '' : '');
+        const name = val('name');
+        if (!name || /合计|总计|小计/.test(name)) continue;
+        out.push({
+          code: val('code'),
+          name,
+          credit: val('credit'),
+          teacher: val('teacher'),
+          time: val('time'),
+          place: val('place'),
+          cat: val('cat'),
+        });
+      }
+    });
+    return out;
+  }
+
+  // 卡片式课程：按“字段名：值”解析
+  function extractCardCourses(doc) {
+    const out = [];
+    const seen = new Set();
+    for (const btn of pickButtons(doc)) {
+      let p = btn.parentElement;
+      let block = null;
+      for (let i = 0; i < 6 && p; i++, p = p.parentElement) {
+        const t = (p.innerText || p.textContent || '').trim();
+        if (t.length > 30 && t.length < 1500) {
+          block = p;
+          break;
+        }
+      }
+      if (!block) continue;
+      const txt = (block.innerText || block.textContent || '').replace(/\s+/g, ' ').trim();
+      if (seen.has(txt)) continue;
+      seen.add(txt);
+      const get = (re) => (txt.match(re) || [])[1] || '';
+      const nameEl = block.querySelector('.name,.title,h3,h4,.course-name,.kc-name');
+      out.push({
+        code: get(/课程(?:编号|号|代码|编码)[:：]\s*([A-Za-z0-9_-]+)/),
+        name: nameEl ? (nameEl.innerText || nameEl.textContent || '').trim() : '',
+        credit: get(/学分[:：]\s*([\d.]+)/),
+        teacher: get(/(?:任课)?教师[:：]\s*([^\s|,，]+)/),
+        time: get(/上课时间[:：]\s*([^|]+?)(?=\s*(?:上课地点|地点|学分|$))/),
+        place: get(/(?:上课地点|地点)[:：]\s*([^|]+?)(?=\s*(?:学分|类别|$))/),
+        cat: get(/(?:通选课类别|课程类别|类别)[:：]\s*([^\s|,，]+)/),
+      });
+    }
+    return out;
+  }
+
+  function extractAllCourses() {
+    const out = [];
+    const seen = new Set();
+    for (const win of collectWins()) {
+      let rows = extractTableCourses(win.document);
+      if (!rows.length) rows = extractCardCourses(win.document);
+      for (const r of rows) {
+        if (!r.name) continue;
+        const k = [r.code, r.name, r.time, r.teacher].join('|');
+        if (seen.has(k)) continue;
+        seen.add(k);
+        out.push(r);
+      }
+    }
+    return out;
+  }
+
+  function nextPageBtn() {
+    const sels = [
+      '.layui-laypage-next',
+      '.pagination .next',
+      '.pager .next',
+      'a[title="下一页"]',
+      'a[title="下页"]',
+    ];
+    for (const win of collectWins()) {
+      for (const s of sels) {
+        const el = win.document.querySelector(s);
+        if (el && !/disabled/.test(el.className)) return el;
+      }
+      const el = [...win.document.querySelectorAll('a,button')].find((n) =>
+        /^(下一页|下页|>)$/.test((n.innerText || '').trim())
+      );
+      if (el && !/disabled/.test(el.className)) return el;
+    }
+    return null;
+  }
+
+  function csvCell(v) {
+    const s = String(v == null ? '' : v);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+
+  async function exportCourses() {
+    const all = [];
+    const seen = new Set();
+    let page = 0;
+    while (page < 30) {
+      page++;
+      for (const r of extractAllCourses()) {
+        const k = [r.code, r.name, r.time, r.teacher].join('|');
+        if (seen.has(k)) continue;
+        seen.add(k);
+        all.push(r);
+      }
+      const next = nextPageBtn();
+      if (!next) break;
+      log(`已读取第 ${page} 页，继续翻页…`);
+      next.click();
+      await sleep(1500);
+    }
+    if (!all.length) {
+      log('没读到课程：先进入选课列表页，看到课程再点“导出”');
+      return;
+    }
+    const header = ['课程编号', '课程名称', '学分', '教师', '上课时间', '上课地点', '通选课类别'];
+    const lines = [header].concat(
+      all.map((r) => [r.code, r.name, r.credit, r.teacher, r.time, r.place, r.cat])
+    );
+    const csv = '\ufeff' + lines.map((row) => row.map(csvCell).join(',')).join('\r\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `公选课列表_${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      URL.revokeObjectURL(a.href);
+      a.remove();
+    }, 2000);
+    log(`共导出 ${all.length} 门（${page} 页），CSV 已下载`);
+    console.log('[抢课] 课程数据', all);
+  }
+
   // ------------------------------------------------------------ 小窗 UI
 
   const CSS = `
@@ -726,13 +1006,18 @@
     border-radius:5px;cursor:pointer;line-height:20px}
   #xk-body{padding:10px}
   .xk-hint{color:#6b7a90;margin-bottom:6px}
-  .xk-target{display:flex;gap:6px;margin-bottom:6px}
+  .xk-target{border:1px solid #e6ecf3;border-radius:7px;padding:6px;margin-bottom:6px;background:#fbfcfe}
+  .xk-line1,.xk-line2{display:flex;gap:6px}
+  .xk-line2{margin-top:6px}
   .xk-target input{min-width:0;border:1px solid #cfd8e3;border-radius:5px;padding:4px 6px;
     font:12px/1.4 inherit;color:#1f2d3d}
   .xk-target .xk-name{flex:1.4}
   .xk-target .xk-teacher{flex:1}
-  .xk-target select{width:56px;border:1px solid #cfd8e3;border-radius:5px;padding:3px 2px;
+  .xk-target select{width:92px;border:1px solid #cfd8e3;border-radius:5px;padding:3px 2px;
     font:12px/1.4 inherit;color:#1f2d3d;background:#fff}
+  .xk-target .xk-place{flex:1}
+  .xk-opt{display:flex;align-items:center;gap:6px;margin:2px 0 8px;color:#c0392b;font-size:11px}
+  .xk-opt input{accent-color:#c0392b}
   .xk-del{border:0;background:#f2f5f9;color:#9aa7b8;border-radius:5px;width:24px;cursor:pointer}
   #xk-add{width:100%;border:1px dashed #9dc0e8;background:#f7fbff;color:#2476c9;
     border-radius:5px;padding:4px;cursor:pointer;margin-bottom:8px}
@@ -744,8 +1029,9 @@
   .xk-btns button{flex:1;border:0;border-radius:6px;padding:6px 0;cursor:pointer;font:12px inherit}
   #xk-start{background:#2476c9;color:#fff}
   #xk-stop{background:#eef2f7;color:#44546a}
-  #xk-scan,#xk-copy{background:#eef2f7;color:#44546a}
+  #xk-scan,#xk-copy,#xk-export{background:#eef2f7;color:#44546a}
   #xk-status{color:#2476c9;min-height:18px;margin-bottom:4px}
+  #xk-recommend{color:#2476c9;font-size:11px;margin:-3px 0 7px 20px}
   #xk-log{max-height:132px;overflow:auto;background:#f7f9fc;border:1px solid #eef1f6;
     border-radius:6px;padding:4px 6px;font-size:11px;color:#5b6b80}
   #xk-win.xk-fold #xk-body{display:none}
@@ -761,14 +1047,19 @@
     const row = document.createElement('div');
     row.className = 'xk-target';
     row.innerHTML = `
-      <input class="xk-name" placeholder="课程名（留空=任意）" value="${escapeAttr(t.name || '')}">
-      <input class="xk-teacher" placeholder="教师（可选）" value="${escapeAttr(t.teacher || '')}">
-      <select class="xk-cat" title="课程类别">
-        <option value="">不限</option>
-        <option value="文化">文化</option>
-        <option value="艺术">艺术</option>
-      </select>
-      <button class="xk-del" title="删除">×</button>
+      <div class="xk-line1">
+        <input class="xk-name" placeholder="课程名（留空=任意）" value="${escapeAttr(t.name || '')}">
+        <input class="xk-teacher" placeholder="教师（可选）" value="${escapeAttr(t.teacher || '')}">
+        <button class="xk-del" title="删除">×</button>
+      </div>
+      <div class="xk-line2">
+        <select class="xk-cat" title="课程类别">
+          <option value="">类别不限</option>
+          <option value="文化">文化</option>
+          <option value="艺术">艺术</option>
+        </select>
+        <input class="xk-place" list="xk-places" placeholder="教室（可选，如 崇德205）" value="${escapeAttr(t.place || '')}">
+      </div>
     `;
     list.appendChild(row);
     row.querySelector('.xk-cat').value = t.cat || '';
@@ -780,6 +1071,20 @@
     row.querySelectorAll('input,select').forEach((inp) => {
       inp.addEventListener('change', persist);
     });
+  }
+
+  // 把当前页面出现过的教室填进下拉候选
+  function refreshPlaceOptions() {
+    const dl = document.getElementById('xk-places');
+    if (!dl) return;
+    const places = new Set();
+    for (const win of collectWins()) {
+      for (const r of extractTableCourses(win.document)) if (r.place) places.add(r.place);
+      for (const r of extractCardCourses(win.document)) if (r.place) places.add(r.place);
+    }
+    const list = [...places].sort();
+    if (!list.length) return;
+    dl.innerHTML = list.map((p) => `<option value="${escapeAttr(p)}"></option>`).join('');
   }
 
   function buildUI() {
@@ -798,18 +1103,22 @@
         <button id="xk-min" title="折叠">—</button>
       </div>
       <div id="xk-body">
-        <div class="xk-hint">目标（按优先级；课名留空=该类别任意一门保底）</div>
+        <div class="xk-hint">目标（按优先级；终极模式下全部留空=任意有空位的课）</div>
         <div id="xk-list"></div>
         <button id="xk-add">+ 添加一门</button>
         <div class="xk-row2">
           <label>最多选 <input id="xk-max" type="number" min="1" max="2" value="${cfg.maxCourses}"> 门</label>
           <label>开始 <input id="xk-start-at" type="time" step="1" value="${cfg.startAt}"></label>
         </div>
+        <label class="xk-opt"><input id="xk-ultimate" type="checkbox"${cfg.ultimate ? ' checked' : ''}> 终极模式：有课直接抢（过滤已满、持续查询）</label>
+        <div id="xk-recommend">推荐打开过滤已满课程</div>
+        <datalist id="xk-places"></datalist>
         <div class="xk-btns">
           <button id="xk-start">开始</button>
           <button id="xk-stop">停止</button>
           <button id="xk-scan">检测</button>
           <button id="xk-copy">结构</button>
+          <button id="xk-export">导出</button>
         </div>
         <div id="xk-status">未运行</div>
         <div id="xk-log"></div>
@@ -834,8 +1143,10 @@
     win.querySelector('#xk-stop').onclick = stop;
     win.querySelector('#xk-scan').onclick = testScan;
     win.querySelector('#xk-copy').onclick = copyStructure;
+    win.querySelector('#xk-export').onclick = exportCourses;
     win.querySelector('#xk-max').addEventListener('change', persist);
     win.querySelector('#xk-start-at').addEventListener('change', persist);
+    win.querySelector('#xk-ultimate').addEventListener('change', persist);
 
     if (store.get(OPEN_KEY, true) === false) win.classList.add('xk-fold');
     win.querySelector('#xk-min').onclick = () => {
@@ -874,6 +1185,7 @@
     });
 
     log('助手已加载；填好目标后点“检测”确认能对上课程（Alt+X 折叠）');
+    setTimeout(refreshPlaceOptions, 1200);
   }
 
   // ------------------------------------------------------------ 启动
@@ -916,4 +1228,11 @@
       if (win) win.classList.toggle('xk-fold');
     }
   });
+
+  // 控制台调试/二次导出用
+  try {
+    window.__xk = { extractAllCourses, exportCourses };
+  } catch (e) {
+    /* 忽略 */
+  }
 })();
